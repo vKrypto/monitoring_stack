@@ -226,8 +226,12 @@ services:
     volumes:
       - /data/stacks/monitoring/glitchtip:/bootstrap:ro
     deploy:
+      # Retries on failure so it survives Postgres still starting on a fresh data dir;
+      # a successful exit is final, so it still only runs once.
       restart_policy:
-        condition: none
+        condition: on-failure
+        delay: 10s
+        max_attempts: 30
 
   # GlitchTip is pinned to the exact image digest it ran as in job_seeker_stack
   # (6.2.6) so the move does not also upgrade it. To upgrade, change the digest.

@@ -150,17 +150,26 @@ echo "==> Waiting for services to converge..."
 ssh "$DEPLOY_SSH" "bash -s '${STACK_NAME}'" <<'REMOTE'
 set -euo pipefail
 stack="$1"
+migrate_state() { docker service ps "${stack}_glitchtip_migrate" --format '{{.CurrentState}}' 2>/dev/null | head -1 || true; }
 for _ in $(seq 1 60); do
   pending=$(docker stack services "$stack" --format '{{.Name}} {{.Replicas}}' | awk '{
     split($2,a,"/"); n=$1; sub(/^'"$stack"'_/,"",n);
     if (n=="glitchtip_migrate") next;
     if (a[1]!=a[2]) printf "%s(%s) ", n, $2
   }')
-  [ -z "$pending" ] && break
-  echo "    $(date +%T) waiting: $pending"
+  mig="$(migrate_state)"
+  case "$mig" in Complete*|"") mig_done=1 ;; *) mig_done=0 ;; esac
+  [ -z "$pending" ] && [ "$mig_done" = 1 ] && break
+  echo "    $(date +%T) waiting: ${pending}$([ "$mig_done" = 1 ] || echo "glitchtip_migrate(${mig})")"
   sleep 10
 done
 docker stack services "$stack"
+# A run-once job settles at 0/1 whether it succeeded or failed, so check its outcome explicitly.
+mig="$(migrate_state)"
+case "$mig" in
+  Complete*|"") ;;
+  *) echo "ERROR: glitchtip_migrate did not complete: ${mig} (docker service logs ${stack}_glitchtip_migrate)" >&2; exit 3 ;;
+esac
 REMOTE
 echo
 echo "==> Done."
