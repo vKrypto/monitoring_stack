@@ -1,0 +1,158 @@
+version: "3.8"
+
+# Port block: 10000-10099 (see ../../ports.md for the fleet-wide scheme).
+# All persistent data lives on bind-mounted host folders under
+# /data/stacks/monitoring/data/<service> -- not raw Docker volumes -- so it's
+# directly inspectable/backupable from the host. Internal service-to-service
+# calls resolve by container name on this stack's own overlay network.
+
+services:
+  node-exporter:
+    image: prom/node-exporter:latest
+    networks:
+      - monitoring
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - '--path.rootfs=/host'
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    networks:
+      - monitoring
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /data/docker:/var/lib/docker:ro
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  prometheus:
+    image: prom/prometheus:latest
+    networks:
+      - monitoring
+    volumes:
+      - /data/stacks/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /data/stacks/monitoring/data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  grafana:
+    image: grafana/grafana:latest
+    networks:
+      - monitoring
+    ports:
+      - "10000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - /data/stacks/monitoring/data/grafana:/var/lib/grafana
+      - /data/stacks/monitoring/grafana-provisioning:/etc/grafana/provisioning:ro
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  mongodb:
+    image: mongo:7
+    networks:
+      - monitoring
+    volumes:
+      - /data/stacks/monitoring/data/mongodb:/data/db
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  opensearch:
+    image: opensearchproject/opensearch:2
+    networks:
+      - monitoring
+    environment:
+      discovery.type: single-node
+      plugins.security.disabled: 'true'
+      OPENSEARCH_JAVA_OPTS: '-Xms1g -Xmx1g'
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      bootstrap.memory_lock: 'true'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /data/stacks/monitoring/data/opensearch:/usr/share/opensearch/data
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  graylog:
+    image: graylog/graylog:6.1
+    networks:
+      - monitoring
+    depends_on:
+      - mongodb
+      - opensearch
+    environment:
+      GRAYLOG_PASSWORD_SECRET: ${GRAYLOG_PASSWORD_SECRET}
+      GRAYLOG_ROOT_PASSWORD_SHA2: ${GRAYLOG_ROOT_PASSWORD_SHA2}
+      GRAYLOG_HTTP_EXTERNAL_URI: 'http://192.168.100.10:10001/'
+      GRAYLOG_MONGODB_URI: 'mongodb://mongodb:27017/graylog'
+      GRAYLOG_ELASTICSEARCH_HOSTS: 'http://opensearch:9200'
+    ports:
+      - "10001:9000"
+      - "10002:12201/udp"
+      - "12201:12201/udp"
+    volumes:
+      - /data/stacks/monitoring/data/graylog:/usr/share/graylog/data
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    networks:
+      - monitoring
+    ports:
+      - "10003:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /data/stacks/monitoring/data/portainer:/data
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    networks:
+      - monitoring
+    ports:
+      - "10004:80"
+    environment:
+      FB_ADDRESS: '0.0.0.0'
+      FB_PORT: '80'
+      FB_ROOT: /srv
+      FB_DATABASE: /database/filebrowser.db
+      FB_USERNAME: admin
+      FB_PASSWORD: ${FILEBROWSER_ADMIN_PASSWORD_HASH}
+    volumes:
+      # Read-only: this is every stack's live bind-mounted app data (DBs
+      # included) -- browsing/downloading is safe, editing through the UI
+      # while a service is writing to the same files is not.
+      - /data/stacks:/srv:ro
+      - /data/stacks/monitoring/data/filebrowser:/database
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+networks:
+  monitoring:
+    driver: overlay

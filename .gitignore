@@ -1,0 +1,7 @@
+# secrets
+.env
+
+# runtime state lives on the VM (/data/stacks/monitoring/data), never in git
+data/
+
+*.bak
