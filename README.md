@@ -1,7 +1,8 @@
 # monitoring_stack
 
 Source of truth for the Swarm stack `monitoring_stack` on the Proxmox VM
-(`192.168.100.10`). Copied from `/data/stacks/monitoring` on 2026-09-20.
+(`192.168.100.10`), copied from `/data/stacks/monitoring` on 2026-09-20, and for the services the
+Proxmox hypervisor (`192.168.100.4`) and that VM run outside Docker ([`host/`](#host-services-outside-docker)).
 
 | Service | Port on the VM | Notes |
 |---|---|---|
@@ -17,11 +18,11 @@ Source of truth for the Swarm stack `monitoring_stack` on the Proxmox VM
 ```bash
 cp .env.example .env      # first time only, then fill it in
 ./deploy.sh --dry-run     # read-only: checks + what would change
-./deploy.sh               # create data dirs, copy config, docker stack deploy
+./deploy.sh               # create data dirs, apply host/, copy config, docker stack deploy
 ```
 
-`deploy.sh` needs the ssh alias `docker-vm` (ubuntu, passwordless sudo) and a
-Swarm manager with `vm.max_map_count >= 262144` (OpenSearch) and `/data/docker`
+`deploy.sh` needs the ssh aliases `docker-vm` (ubuntu, passwordless sudo) and `proxmox` (root on the
+hypervisor), and a Swarm manager with `vm.max_map_count >= 262144` (OpenSearch) and `/data/docker`
 present (cAdvisor). It checks all of this and prints the fix if something is off.
 
 ## GlitchTip (error tracking for all projects)
@@ -57,9 +58,41 @@ service with persistent data: bind-mount `/data/stacks/monitoring/data/<name>`, 
 owner and mode to the `SPEC` list in `deploy.sh`, and add any new secrets to `.env`, `.env.example` and
 `REQUIRED_ENV`. Ports stay in `10000-10099`. Then `./deploy.sh --dry-run` and `./deploy.sh`.
 
+## Host services (outside Docker)
+
+`deploy.sh` also applies `host/`: what the hypervisor and the VM run outside Docker. `host/<target>/files/`
+mirrors `/` on that machine and `host/<target>/apply.sh` installs it; `deploy.sh` streams it over ssh and
+runs it there, so nothing is left behind. Targets: `proxmox` (`PVE_SSH`, root@192.168.100.4) and
+`docker-vm` (`DEPLOY_SSH`, run with sudo).
+
+| Where | What | What deploy.sh manages |
+|---|---|---|
+| Proxmox | Samba share `backup_drive` (+ `wsdd2` for Windows discovery), anonymous FTP (ProFTPD, `ftp://192.168.100.4/`), NFS export to `192.168.100.8` and `.10`; all serve the NTFS backup drive at `/mnt/nfs/backup_drive` | packages, `smb.conf`, `proftpd.conf`, `/etc/exports`, the four `backup_drive.conf` start-order drop-ins, the drive's fstab line and its immutable bare mountpoint, service state |
+| Proxmox | native File Browser on `:8080` (root `/tank`) | the pinned v2.63.23 binary (sha256-checked) and its unit file; the database and its `admin` user only when the database does not exist yet |
+| Proxmox | `backup-pve-config` (03:00, tar of `/etc/pve` into `/tank/backup/pve-config`, 30 days) and `zfs-vm100-data-snapshot.sh` (03:30, snapshot of VM 100's data disk, keeps 7) | the scripts and their `/etc/cron.d` entries |
+| Proxmox | Ceph monitor + manager (no OSDs, no pools) | **reported only**, never created or changed; `host/proxmox/reference/ceph.conf` is a record of its config |
+| Swarm VM | `registry-retention.py` (04:00, keeps the 5 newest versions per repo in the local registry, then garbage-collects) | the script and its `/etc/cron.d` entry |
+
+How `apply.sh` behaves, on both targets:
+
+- **Idempotent.** A file that already matches byte for byte is not touched, so a deploy to the current hosts
+  changes nothing. `./deploy.sh --dry-run` lists every file as `ok`, `DIFFERS` or `MISSING`.
+- **Validated first.** A changed `smb.conf` goes through `testparm` and a changed `proftpd.conf` through
+  `proftpd -t` before it replaces the live one. If either fails, nothing is replaced.
+- **Backed up.** A replaced file is first copied to `/var/backups/monitoring_stack/<timestamp>/`, and only
+  the services that depend on it are reloaded.
+- **Fresh host.** It also installs the packages (`samba wsdd2 proftpd-core nfs-kernel-server`) and creates
+  the File Browser database. That needs `PVE_FILEBROWSER_ADMIN_PASSWORD` in `.env` (see `.env.example`);
+  an existing database is never touched, so the current host does not need it.
+- **Ceph** is not created by `deploy.sh`: the current one has a monitor and a manager but no OSDs or pools,
+  so it stores nothing. Set it up by hand on a new host if you want it.
+- **Not captured:** the drive and its contents, the Samba password database (the `backupuser` account), the
+  File Browser database, and the Docker daemon config on the VM (`/etc/docker/daemon.json`: `data-root` and
+  the insecure registry; applying it restarts Docker, so it is not automated).
+
 ## What is and isn't in this repo
 
-- **In git:** `docker-compose.yml`, `prometheus/`, `grafana-provisioning/`, `glitchtip/`, `deploy.sh`, `scripts/`.
+- **In git:** `docker-compose.yml`, `prometheus/`, `grafana-provisioning/`, `glitchtip/`, `deploy.sh`, `scripts/`, `host/`.
 - **Not in git:** `.env` (secrets, see `.env.example`) and `data/` (about 1.5 GB of runtime
   state on the VM: Prometheus TSDB, Graylog, MongoDB, OpenSearch, Grafana and Portainer
   state). `deploy.sh` recreates the empty `data/<service>` dirs with the right owners, but
