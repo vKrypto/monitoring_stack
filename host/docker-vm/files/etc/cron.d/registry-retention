@@ -1,0 +1,4 @@
+# Keep only the 5 most recent unique versions per repo in the local Docker
+# registry (registry_stack_registry), then garbage-collect reclaimed blobs.
+# Installed 2026-09-16.
+0 4 * * * root /usr/local/sbin/registry-retention.py --apply >> /var/log/registry-retention.log 2>&1

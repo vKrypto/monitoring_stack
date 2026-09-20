@@ -5,11 +5,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # ─────────────────────────────────────────────────────────────────────────────
 # Recreate the monitoring stack (Graylog + OpenSearch + MongoDB, Grafana,
 # Prometheus, node-exporter, cAdvisor, Portainer, Filebrowser) on the Proxmox
-# Swarm VM from THIS folder.
+# Swarm VM from THIS folder, plus the services the Proxmox hypervisor and that
+# VM run outside Docker (host/: Samba/FTP/NFS shares of the backup drive, the
+# native File Browser, the backup and snapshot jobs, registry retention).
 #
 #   ./deploy.sh --dry-run    read-only: run every check, show what would be
-#                            created/copied, change nothing, deploy nothing
-#   ./deploy.sh              create data dirs, copy config, `docker stack deploy`
+#                            created/copied/replaced, change nothing, deploy nothing
+#   ./deploy.sh              create data dirs, apply host/, copy config, `docker stack deploy`
 #
 # Layout on the VM (REMOTE_STACK_DIR is fixed: docker-compose.yml bind-mounts
 # these absolute paths):
@@ -17,11 +19,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 #     docker-compose.yml  .env  prometheus/  grafana-provisioning/  glitchtip/   <- from this repo
 #     data/<service>/                                                <- runtime state, never in git
 #
+# host/<target>/files mirrors / on that machine and host/<target>/apply.sh installs it
+# (details in host/lib.sh and README.md). Targets: proxmox = root@192.168.100.4 (PVE_SSH),
+# docker-vm = the Swarm VM (DEPLOY_SSH, applied with sudo).
+#
 # Not covered here: the openresty vhosts (e.g. graylog.local.internal) live in
 # the VM's proxy_stack, and the service data itself (see README.md).
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEPLOY_SSH="${DEPLOY_SSH:-docker-vm}"                 # ssh alias -> ubuntu@192.168.100.10
+PVE_SSH="${PVE_SSH:-proxmox}"                         # ssh alias -> root@192.168.100.4 (the hypervisor)
 STACK_NAME="${STACK_NAME:-monitoring_stack}"
 COMPOSE_FILE="docker-compose.yml"
 REMOTE_STACK_DIR="/data/stacks/monitoring"
@@ -57,7 +64,10 @@ for v in "${REQUIRED_ENV[@]}"; do [[ -n "${!v:-}" ]] || missing+=("$v"); done
 render_err="$(docker stack config -c "$COMPOSE_FILE" 2>&1 >/dev/null)" || die "${COMPOSE_FILE} does not render: ${render_err}"
 [[ "$render_err" != *"is not set"* ]] || die "${COMPOSE_FILE} uses an unset variable: ${render_err}"
 ssh -o BatchMode=yes -o ConnectTimeout=8 "$DEPLOY_SSH" true || die "cannot ssh to ${DEPLOY_SSH}"
-echo "    .env complete, compose renders, ssh ok"
+ssh -o BatchMode=yes -o ConnectTimeout=8 "$PVE_SSH" true || die "cannot ssh to ${PVE_SSH} (the Proxmox hypervisor; alias in ~/.ssh/config)"
+[[ -f host/lib.sh && -f host/proxmox/apply.sh && -f host/docker-vm/apply.sh ]] || die "host/ is incomplete (it needs lib.sh and both apply.sh)"
+for f in host/lib.sh host/proxmox/apply.sh host/docker-vm/apply.sh; do bash -n "$f" || die "$f has a syntax error"; done
+echo "    .env complete, compose renders, host scripts parse, ssh ok (${DEPLOY_SSH}, ${PVE_SSH})"
 
 # ── 2. VM prerequisites + data directories ─────────────────────────────────
 # Swarm (unlike `docker run`) does not auto-create missing bind-mount paths, and
@@ -112,7 +122,39 @@ if (( prep_rc != 0 )); then
   echo "    (dry-run: prerequisites above would block a real deploy)"
 fi
 
-# ── 3. Ship the config ─────────────────────────────────────────────────────
+# ── 3. Host services outside Docker ────────────────────────────────────────
+# host/<target>/files mirrors / on that machine; host/<target>/apply.sh installs it: files are
+# byte-compared, a changed config is validated before it replaces the live one (old copy kept
+# in /var/backups/monitoring_stack/), only the services that depend on it are reloaded, and
+# each service is made sure to run. The folder is streamed over ssh and run there, so nothing is
+# left behind; with --dry-run apply.sh only reports. The first stdin line is the one secret it
+# can need (the File Browser admin password, used only when that database does not exist yet),
+# the rest is the tar stream.
+read -r -d '' REMOTE_APPLY <<'EOS' || true
+IFS= read -r secret
+dir="$1"; sudo="$2"; flag="$3"
+d="$(mktemp -d)" || exit 1
+trap 'rm -rf "$d"' EXIT
+tar -xf - -C "$d" || exit 1
+FB_ADMIN_PASSWORD="$secret" $sudo bash "$d/$dir/apply.sh" $flag
+EOS
+apply_host() {   # label ssh-target dir sudo-prefix [secret]
+  local label="$1" target="$2" dir="$3" sudo="$4" secret="${5:-}" flag="" b64
+  (( DRY_RUN )) && flag="--dry-run"
+  b64="$(printf '%s' "$REMOTE_APPLY" | base64 -w0)"
+  echo "==> ${label}  (${target})"
+  { printf '%s\n' "$secret"; tar -C host --owner=0 --group=0 -cf - lib.sh "${dir}/apply.sh" "${dir}/files"; } \
+    | ssh -o BatchMode=yes -o ConnectTimeout=8 "$target" "bash -c \"\$(echo ${b64} | base64 -d)\" _ '${dir}' '${sudo}' '${flag}'"
+}
+host_rc=0
+apply_host "Proxmox host services" "$PVE_SSH" proxmox "" "${PVE_FILEBROWSER_ADMIN_PASSWORD:-}" || host_rc=$?
+apply_host "Swarm VM host jobs" "$DEPLOY_SSH" docker-vm "sudo -n" || host_rc=$?
+if (( host_rc != 0 )); then
+  (( DRY_RUN )) || die "host services failed (see FAIL lines above); the stack was not deployed"
+  echo "    (dry-run: the failures above would block a real deploy)"
+fi
+
+# ── 4. Ship the config ─────────────────────────────────────────────────────
 # Only the tracked config goes over; data/ is never touched. rsync -a keeps
 # .env at mode 600.
 if (( DRY_RUN )); then
@@ -125,14 +167,14 @@ if (( DRY_RUN )); then
   fi
   echo "==> [dry-run] would run on the VM:"
   echo "    docker stack deploy --detach=true --resolve-image changed -c ${COMPOSE_FILE} ${STACK_NAME}"
-  (( prep_rc == 0 )) || exit 1
+  (( prep_rc == 0 && host_rc == 0 )) || exit 1
   exit 0
 fi
 
 echo "==> Copying config -> ${DEPLOY_SSH}:${REMOTE_STACK_DIR}/"
 rsync -az "${SYNC_ITEMS[@]}" "${DEPLOY_SSH}:${REMOTE_STACK_DIR}/"
 
-# ── 4. Deploy the stack ON the VM ─────────────────────────────────────────
+# ── 5. Deploy the stack ON the VM ─────────────────────────────────────────
 # Run it there so ${VAR} interpolation resolves against the copied .env.
 # --resolve-image changed: only look up image digests for services that are new
 # or whose image reference changed, so a redeploy does not silently roll the
@@ -143,7 +185,7 @@ ssh "$DEPLOY_SSH" "cd '${REMOTE_STACK_DIR}' \
   && set -a && . ./.env && set +a \
   && docker stack deploy --detach=true --resolve-image changed -c '${COMPOSE_FILE}' '${STACK_NAME}'"
 
-# ── 5. Wait for convergence + report ─────────────────────────────────────
+# ── 6. Wait for convergence + report ─────────────────────────────────────
 # Graylog/OpenSearch are JVMs and can take a minute or two to report healthy.
 # glitchtip_migrate is a run-once job that settles at 0/1 - that counts as done.
 echo "==> Waiting for services to converge..."
@@ -178,3 +220,4 @@ echo "    Graylog     http://192.168.100.10:10001   (GELF UDP: 10002 and 12201)"
 echo "    Portainer   https://192.168.100.10:10003"
 echo "    Filebrowser http://192.168.100.10:10004"
 echo "    GlitchTip   http://192.168.100.10:10005   (login: ${GLITCHTIP_ADMIN_EMAIL}, password in .env)"
+printf '%s\n' '    Proxmox     File Browser http://192.168.100.4:8080   FTP ftp://192.168.100.4/   Samba \\192.168.100.4\backup_drive'

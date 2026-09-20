@@ -1,0 +1,3 @@
+# Daily protective ZFS snapshot of VM 100's data disk (excluded from vzdump
+# via backup=0 as of 2026-09-16 -- see storage-plan.md Approach A). Keeps last 7.
+30 3 * * * root /usr/local/sbin/zfs-vm100-data-snapshot.sh >> /var/log/zfs-vm100-data-snapshot.log 2>&1

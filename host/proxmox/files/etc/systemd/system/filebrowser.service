@@ -1,0 +1,13 @@
+[Unit]
+Description=File Browser (browse /tank ZFS storage: ISOs, backups, vmdata)
+After=zfs-mount.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/filebrowser -d /etc/filebrowser/filebrowser.db
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
