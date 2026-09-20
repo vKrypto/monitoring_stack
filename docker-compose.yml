@@ -6,6 +6,20 @@ version: "3.8"
 # directly inspectable/backupable from the host. Internal service-to-service
 # calls resolve by container name on this stack's own overlay network.
 
+# Shared by the three GlitchTip app services below. ENABLE_USER_REGISTRATION=false
+# closes open signup; the only account is the admin created by glitchtip_migrate.
+x-glitchtip-env: &glitchtip-env
+  DATABASE_URL: postgresql://glitchtip:${GLITCHTIP_DB_PASSWORD}@glitchtip_db:5432/glitchtip
+  REDIS_URL: redis://glitchtip_redis:6379/0
+  SECRET_KEY: ${GLITCHTIP_SECRET_KEY}
+  EMAIL_URL: consolemail://
+  GLITCHTIP_DOMAIN: ${GLITCHTIP_DOMAIN:-http://192.168.100.10:10005}
+  DEFAULT_AUTO_FIELD: django.db.models.BigAutoField
+  CELERY_WORKER_CONCURRENCY: '2'
+  ENABLE_USER_REGISTRATION: 'false'
+  GLITCHTIP_ADMIN_EMAIL: ${GLITCHTIP_ADMIN_EMAIL}
+  GLITCHTIP_ADMIN_PASSWORD: ${GLITCHTIP_ADMIN_PASSWORD}
+
 services:
   node-exporter:
     image: prom/node-exporter:latest
@@ -152,6 +166,117 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
+
+  # ── GlitchTip ─────────────────────────────────────────────────────────────
+  # Self-hosted, Sentry-compatible error tracking, shared by every project
+  # (job-seeker, ...). Moved here from job_seeker_stack; its Postgres data now
+  # lives in data/glitchtip-db. Each project gets a DSN like
+  #   http://<key>@192.168.100.10:10005/<project_id>
+  # (create the project in the UI: Project Settings -> Client Keys).
+  glitchtip_db:
+    image: postgres:16-alpine
+    user: "1000:1000"
+    networks:
+      - monitoring
+    environment:
+      POSTGRES_DB: glitchtip
+      POSTGRES_USER: glitchtip
+      # Only used when the data dir is first created; an existing data dir keeps
+      # the password it was made with, so this must match what is stored there.
+      POSTGRES_PASSWORD: ${GLITCHTIP_DB_PASSWORD}
+    volumes:
+      - /data/stacks/monitoring/data/glitchtip-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glitchtip"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  glitchtip_redis:
+    image: redis:7-alpine
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  # Run-once job: migrate the schema, then create/re-sync the admin from
+  # GLITCHTIP_ADMIN_EMAIL / GLITCHTIP_ADMIN_PASSWORD (see glitchtip/bootstrap_admin.py).
+  # Shows 0/1 once finished; that is normal. It re-runs when its spec changes,
+  # e.g. after rotating the admin password in .env and redeploying.
+  glitchtip_migrate:
+    image: glitchtip/glitchtip:latest@sha256:a3d8eb1b36c1e1603d55ab32711ea3dd8115874742a781a57391a62a16e0dff6
+    networks:
+      - monitoring
+    command:
+      - sh
+      - -c
+      - python manage.py migrate --noinput && python manage.py shell -c "exec(open('/bootstrap/bootstrap_admin.py').read())"
+    environment: *glitchtip-env
+    volumes:
+      - /data/stacks/monitoring/glitchtip:/bootstrap:ro
+    deploy:
+      restart_policy:
+        condition: none
+
+  # GlitchTip is pinned to the exact image digest it ran as in job_seeker_stack
+  # (6.2.6) so the move does not also upgrade it. To upgrade, change the digest.
+  glitchtip:
+    image: glitchtip/glitchtip:latest@sha256:a3d8eb1b36c1e1603d55ab32711ea3dd8115874742a781a57391a62a16e0dff6
+    networks:
+      - monitoring
+    ports:
+      - "10005:8000"
+    environment: *glitchtip-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost',8000))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  glitchtip_worker:
+    image: glitchtip/glitchtip:latest@sha256:a3d8eb1b36c1e1603d55ab32711ea3dd8115874742a781a57391a62a16e0dff6
+    command: ./bin/run-worker.sh
+    networks:
+      - monitoring
+    environment: *glitchtip-env
+    healthcheck:
+      # Matches the real `manage.py runworker` process. The pattern is built from two
+      # strings so the check's own command line can't match itself.
+      test: ["CMD", "python", "-c", "import os,sys; k='manage.py run'+'worker'; sys.exit(0 if any(k in open(f'/proc/{p}/cmdline','rb').read().decode(errors='ignore').replace(chr(0),' ') for p in os.listdir('/proc') if p.isdigit()) else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  glitchtip_postgres_exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    networks:
+      - monitoring
+    environment:
+      DATA_SOURCE_NAME: postgresql://glitchtip:${GLITCHTIP_DB_PASSWORD}@glitchtip_db:5432/glitchtip?sslmode=disable
+    deploy:
+      restart_policy:
+        condition: on-failure
+
+  # ═══ NEW SERVICES GO HERE, right after GlitchTip (above the top-level `networks:`) ═══
 
 networks:
   monitoring:

@@ -14,7 +14,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # Layout on the VM (REMOTE_STACK_DIR is fixed: docker-compose.yml bind-mounts
 # these absolute paths):
 #   /data/stacks/monitoring/
-#     docker-compose.yml  .env  prometheus/  grafana-provisioning/   <- from this repo
+#     docker-compose.yml  .env  prometheus/  grafana-provisioning/  glitchtip/   <- from this repo
 #     data/<service>/                                                <- runtime state, never in git
 #
 # Not covered here: the openresty vhosts (e.g. graylog.local.internal) live in
@@ -26,8 +26,9 @@ STACK_NAME="${STACK_NAME:-monitoring_stack}"
 COMPOSE_FILE="docker-compose.yml"
 REMOTE_STACK_DIR="/data/stacks/monitoring"
 REQUIRED_ENV=(GRAFANA_ADMIN_PASSWORD GRAYLOG_PASSWORD_SECRET GRAYLOG_ROOT_PASSWORD_SHA2
-              OPENSEARCH_INITIAL_ADMIN_PASSWORD FILEBROWSER_ADMIN_PASSWORD_HASH)
-SYNC_ITEMS=("$COMPOSE_FILE" .env prometheus grafana-provisioning)
+              OPENSEARCH_INITIAL_ADMIN_PASSWORD FILEBROWSER_ADMIN_PASSWORD_HASH
+              GLITCHTIP_DB_PASSWORD GLITCHTIP_SECRET_KEY GLITCHTIP_ADMIN_EMAIL GLITCHTIP_ADMIN_PASSWORD)
+SYNC_ITEMS=("$COMPOSE_FILE" .env prometheus grafana-provisioning glitchtip)
 
 usage() { echo "usage: $0 [--dry-run]   (--dry-run changes nothing; details in the header of this file)"; }
 
@@ -81,6 +82,7 @@ SPEC=(
   ". 1000 1000 0775"
   "data 1000 1000 0755"
   "data/filebrowser 1000 1000 0775"
+  "data/glitchtip-db 1000 1000 0700"
   "data/grafana 472 0 0777"
   "data/graylog 1100 1100 0750"
   "data/mongodb 999 999 0755"
@@ -143,6 +145,7 @@ ssh "$DEPLOY_SSH" "cd '${REMOTE_STACK_DIR}' \
 
 # ── 5. Wait for convergence + report ─────────────────────────────────────
 # Graylog/OpenSearch are JVMs and can take a minute or two to report healthy.
+# glitchtip_migrate is a run-once job that settles at 0/1 - that counts as done.
 echo "==> Waiting for services to converge..."
 ssh "$DEPLOY_SSH" "bash -s '${STACK_NAME}'" <<'REMOTE'
 set -euo pipefail
@@ -150,6 +153,7 @@ stack="$1"
 for _ in $(seq 1 60); do
   pending=$(docker stack services "$stack" --format '{{.Name}} {{.Replicas}}' | awk '{
     split($2,a,"/"); n=$1; sub(/^'"$stack"'_/,"",n);
+    if (n=="glitchtip_migrate") next;
     if (a[1]!=a[2]) printf "%s(%s) ", n, $2
   }')
   [ -z "$pending" ] && break
@@ -164,3 +168,4 @@ echo "    Grafana     http://192.168.100.10:10000"
 echo "    Graylog     http://192.168.100.10:10001   (GELF UDP: 10002 and 12201)"
 echo "    Portainer   https://192.168.100.10:10003"
 echo "    Filebrowser http://192.168.100.10:10004"
+echo "    GlitchTip   http://192.168.100.10:10005   (login: ${GLITCHTIP_ADMIN_EMAIL}, password in .env)"
